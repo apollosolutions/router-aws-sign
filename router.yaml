@@ -1,3 +1,4 @@
 plugins:
-  router_extension_template.hello_world:
-    message: "Hello World!"
+    aws.signv4:
+        enabled: true
+      
