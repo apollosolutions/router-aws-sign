@@ -6,6 +6,7 @@ use apollo_router::plugin::Plugin;
 use apollo_router::plugin::PluginInit;
 use apollo_router::register_plugin;
 use apollo_router::services::subgraph;
+use apollo_router::graphql;
 
 use aws_sigv4::http_request::sign;
 use aws_sigv4::http_request::PayloadChecksumKind;
@@ -16,7 +17,6 @@ use aws_sigv4::http_request::SigningSettings;
 use aws_types::Credentials;
 
 use schemars::JsonSchema;
-// use serde::ser::Error;
 use serde::Deserialize;
 use tower::ServiceExt;
 
@@ -84,8 +84,12 @@ impl Plugin for AwsSign {
                 let body_bytes = match serde_json::to_vec(&request.subgraph_request.body()) {
                     Ok(bytes) => bytes,
                     Err(err) => {
-                        tracing::error!("Failed to serialize GraphQL body for AWS SigV4 signing, skipping signing. Error: {}", err);
-                        return Err(err.into());
+                        tracing::error!("Failed to serialize GraphQL body for AWS SigV4 signing. Error: {}", err);
+                        return Ok(ControlFlow::Break(subgraph::Response::error_builder()
+                                    .error(graphql::Error::builder().message("Failed to serialize GraphQL body for AWS SigV4 signing").build())
+                                    .status_code(http::StatusCode::UNAUTHORIZED)
+                                    .context(request.context)
+                                    .build().unwrap()));
                     }
                 };
     
@@ -99,13 +103,36 @@ impl Plugin for AwsSign {
                 let (signing_instructions, _signature) = match sign(signable_request, &signing_params) {
                     Ok(output) => output,
                     Err(err) => {
-                        tracing::error!("Failed to sign GraphQL request for AWS SigV4, skipping signing. Error: {}", err);
-                        return Err(err.into());
+                        tracing::error!("Failed to sign GraphQL request for AWS SigV4. Error: {}", err);
+                        return Ok(ControlFlow::Break(subgraph::Response::error_builder()
+                                    .error(graphql::Error::builder().message("Failed to sign GraphQL request for AWS SigV4").build())
+                                    .status_code(http::StatusCode::UNAUTHORIZED)
+                                    .context(request.context)
+                                    .build().unwrap()));
                     }
                 }.into_parts();
     
                 signing_instructions.apply_to_request(&mut request.subgraph_request);
                 Ok(ControlFlow::Continue(request))
+            })
+            .map_response(|response: subgraph::Response| {
+                if !response.response.status().is_success() {
+                    return match response.response.headers().get("x-amzn-errortype") {
+                        Some(error) => {
+                            return subgraph::Response::error_builder()
+                                    .error(graphql::Error::builder().message(error.to_str().unwrap()).build())
+                                    .status_code(http::StatusCode::UNAUTHORIZED)
+                                    .context(response.context)
+                                    .build()
+                                    .unwrap()
+                        },
+                        None => {
+                            tracing::error!("AWS SigV4 signing failed, no error type returned");
+                            response
+                        }
+                    }
+                }
+                response
             })
             .buffered()
             .service(service)
