@@ -89,7 +89,7 @@ impl Plugin for AwsSign {
                                     .error(graphql::Error::builder().message("Failed to serialize GraphQL body for AWS SigV4 signing").build())
                                     .status_code(http::StatusCode::UNAUTHORIZED)
                                     .context(request.context)
-                                    .build().unwrap()));
+                                    .build()?));
                     }
                 };
     
@@ -108,7 +108,7 @@ impl Plugin for AwsSign {
                                     .error(graphql::Error::builder().message("Failed to sign GraphQL request for AWS SigV4").build())
                                     .status_code(http::StatusCode::UNAUTHORIZED)
                                     .context(request.context)
-                                    .build().unwrap()));
+                                    .build()?));
                     }
                 }.into_parts();
     
@@ -116,19 +116,28 @@ impl Plugin for AwsSign {
                 Ok(ControlFlow::Continue(request))
             })
             .map_response(|response: subgraph::Response| {
-                if !response.response.status().is_success() {
-                    return match response.response.headers().get("x-amzn-errortype") {
-                        Some(error) => {
-                            return subgraph::Response::error_builder()
-                                    .error(graphql::Error::builder().message(error.to_str().unwrap()).build())
-                                    .status_code(http::StatusCode::UNAUTHORIZED)
-                                    .context(response.context)
-                                    .build()
-                                    .unwrap()
-                        },
-                        None => {
-                            tracing::error!("AWS SigV4 signing failed, no error type returned");
-                            response
+                if response.response.status().is_success() {
+                    return response 
+                }
+                if let Some(error) = response.response.headers().get("x-amzn-errortype") {
+                    let error_str = match error.to_str() {
+                        Ok(str) => str,
+                        Err(err) => {
+                            tracing::error!("Failed to parse x-amzn-errortype header for AWS SigV4. Error: {}", err);
+                            return response
+                        }
+                    };
+                    let gql_response = subgraph::Response::error_builder()
+                            .error(graphql::Error::builder().message(error_str).build())
+                            .status_code(http::StatusCode::UNAUTHORIZED)
+                            .context(response.context.clone())
+                            .build();
+                    
+                    match gql_response {
+                        Ok(response) => return response,
+                        Err(err) => {
+                            tracing::error!("Failed to create error response for AWS SigV4. Error: {}", err);
+                            return response
                         }
                     }
                 }
