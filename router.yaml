@@ -1,6 +1,5 @@
 plugins:
     aws.signv4:
-        enabled: true
         access_key_id: "key"
         secret_access_key: "secret"
         region: "us-east-1"
