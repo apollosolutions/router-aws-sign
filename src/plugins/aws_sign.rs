@@ -1,4 +1,3 @@
-use std::error::Error;
 use std::ops::ControlFlow;
 use std::time::SystemTime;
 
@@ -7,19 +6,17 @@ use apollo_router::plugin::Plugin;
 use apollo_router::plugin::PluginInit;
 use apollo_router::register_plugin;
 use apollo_router::services::subgraph;
+use apollo_router::graphql;
 
-use aws_sig_auth::signer::OperationSigningConfig;
-use aws_sig_auth::signer::RequestConfig;
-use aws_sig_auth::signer::SigV4Signer;
-use aws_smithy_http::body::SdkBody;
-use aws_types::credentials::ProvideCredentials;
-use aws_types::region::Region;
-use aws_types::region::SigningRegion;
+use aws_sigv4::http_request::sign;
+use aws_sigv4::http_request::PayloadChecksumKind;
+use aws_sigv4::http_request::SignableBody;
+use aws_sigv4::http_request::SignableRequest;
+use aws_sigv4::http_request::SigningParams;
+use aws_sigv4::http_request::SigningSettings;
 use aws_types::Credentials;
-use aws_types::SigningService;
 
 use schemars::JsonSchema;
-// use serde::ser::Error;
 use serde::Deserialize;
 use tower::ServiceExt;
 
@@ -37,9 +34,10 @@ struct Conf {
     // Put your plugin configuration here. It will automatically be deserialized from JSON.
     // Always put some sort of config here, even if it is just a bool to say that the plugin is enabled,
     // otherwise the yaml to enable the plugin will be confusing.
-    access_key: String,
-    secret_key: String,
+    access_key_id: String,
+    secret_access_key: String,
     region: String,
+    service: String,
 }
 // This is a bare bones plugin that can be duplicated when creating your own.
 #[async_trait::async_trait]
@@ -47,63 +45,103 @@ impl Plugin for AwsSign {
     type Config = Conf;
 
     async fn new(init: PluginInit<Self::Config>) -> Result<Self, BoxError> {
-        tracing::info!("aws sign access key {}", init.config.access_key);
-        tracing::info!("aws sign secret key {}", init.config.secret_key);
         Ok(AwsSign {
             configuration: init.config,
         })
     }
 
-    // Delete this function if you are not customizing it.
     fn subgraph_service(&self, _name: &str, service: subgraph::BoxService) -> subgraph::BoxService {
-        let provider = Credentials::new(
-            &self.configuration.access_key,
-            &self.configuration.access_key,
+        let aws_credentials = Credentials::new(
+            &self.configuration.access_key_id,
+            &self.configuration.secret_access_key,
             None,
             None,
             "default",
         );
 
-        let region = self.configuration.region.clone();
+        let aws_region = self.configuration.region.clone();
 
-        async fn sign_request(
-            request: &mut http::Request<SdkBody>,
-            region: Region,
-            credentials_provider: &impl ProvideCredentials,
-        ) -> Result<(), Box<dyn Error + Send + Sync>> {
-            let now = SystemTime::now();
-            let signer = SigV4Signer::new();
-            let request_config = RequestConfig {
-                request_ts: now,
-                region: &SigningRegion::from(region),
-                service: &SigningService::from_static("execute-api"),
-                payload_override: None,
-            };
-            signer.sign(
-                &OperationSigningConfig::default_config(),
-                &request_config,
-                &credentials_provider.provide_credentials().await?,
-                request,
-            )?;
-            Ok(())
-        }
+        let aws_service = self.configuration.service.clone();
 
         ServiceBuilder::new()
-            .checkpoint_async(move |mut request: subgraph::Request| {
-                let region = region.clone();
-                let provider = provider.clone();
-                async move {
-                    let (original_parts, original_body) = request.subgraph_request.into_parts();
-                    let string_body = serde_json::to_string(&original_body)?;
-                    let mut temp_request =
-                        http::Request::from_parts(original_parts, SdkBody::from(string_body));
-                    sign_request(&mut temp_request, Region::new(region.clone()), &provider).await?;
-                    let (signed_parts, _signed_body) = temp_request.into_parts();
-                    let signed_request = http::Request::from_parts(signed_parts, original_body);
-                    request.subgraph_request = signed_request;
+            .checkpoint(move |mut request: subgraph::Request| {
+                let now = SystemTime::now();
 
-                    Ok(ControlFlow::Continue(request))
+                let mut settings = SigningSettings::default();
+                settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
+    
+                let mut builder = SigningParams::builder()
+                    .access_key(aws_credentials.access_key_id())
+                    .secret_key(aws_credentials.secret_access_key())
+                    .region(aws_region.as_ref())
+                    .service_name(aws_service.as_ref())
+                    .time(now)
+                    .settings(settings);
+    
+                builder.set_security_token(aws_credentials.session_token());
+                let signing_params = builder.build().expect("all required fields set");
+    
+                let body_bytes = match serde_json::to_vec(&request.subgraph_request.body()) {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        tracing::error!("Failed to serialize GraphQL body for AWS SigV4 signing. Error: {}", err);
+                        return Ok(ControlFlow::Break(subgraph::Response::error_builder()
+                                    .error(graphql::Error::builder().message("Failed to serialize GraphQL body for AWS SigV4 signing").build())
+                                    .status_code(http::StatusCode::UNAUTHORIZED)
+                                    .context(request.context)
+                                    .build()?));
+                    }
+                };
+    
+                let signable_request = SignableRequest::new(
+                    request.subgraph_request.method(),
+                    request.subgraph_request.uri(),
+                    request.subgraph_request.headers(),
+                    SignableBody::Bytes(&body_bytes),
+                );
+    
+                let (signing_instructions, _signature) = match sign(signable_request, &signing_params) {
+                    Ok(output) => output,
+                    Err(err) => {
+                        tracing::error!("Failed to sign GraphQL request for AWS SigV4. Error: {}", err);
+                        return Ok(ControlFlow::Break(subgraph::Response::error_builder()
+                                    .error(graphql::Error::builder().message("Failed to sign GraphQL request for AWS SigV4").build())
+                                    .status_code(http::StatusCode::UNAUTHORIZED)
+                                    .context(request.context)
+                                    .build()?));
+                    }
+                }.into_parts();
+    
+                signing_instructions.apply_to_request(&mut request.subgraph_request);
+                Ok(ControlFlow::Continue(request))
+            })
+            .map_response(|response: subgraph::Response| {
+                if response.response.status().is_success() {
+                    return response 
                 }
+                if let Some(error) = response.response.headers().get("x-amzn-errortype") {
+                    let error_str = match error.to_str() {
+                        Ok(str) => str,
+                        Err(err) => {
+                            tracing::error!("Failed to parse x-amzn-errortype header for AWS SigV4. Error: {}", err);
+                            return response
+                        }
+                    };
+                    let gql_response = subgraph::Response::error_builder()
+                            .error(graphql::Error::builder().message(error_str).build())
+                            .status_code(http::StatusCode::UNAUTHORIZED)
+                            .context(response.context.clone())
+                            .build();
+                    
+                    match gql_response {
+                        Ok(response) => return response,
+                        Err(err) => {
+                            tracing::error!("Failed to create error response for AWS SigV4. Error: {}", err);
+                            return response
+                        }
+                    }
+                }
+                response
             })
             .buffered()
             .service(service)
