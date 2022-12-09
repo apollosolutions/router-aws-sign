@@ -43,55 +43,16 @@ Your release binary is now located in `target/release/router`
 
 > If you are using managed federation you can set APOLLO_KEY and APOLLO_GRAPH_REF environment variables instead of specifying the supergraph as a file.
 
-# Create a plugin
+# Usage
 
-1. From within your project directory scaffold a new plugin
-   ```bash
-   cargo router plugin create hello_world
-   ```
-2. Select the type of plugin you want to scaffold:
-
-   ```bash
-   Select a plugin template:
-   > "basic"
-   "auth"
-   "tracing"
-   ```
-
-   The different templates are:
-
-   - basic - a barebones plugin.
-   - auth - a basic authentication plugin that could make an external call.
-   - tracing - a plugin that adds a custom span and a log message.
-
-   Choose `basic`.
-
-3. Add the plugin to the `router.yaml`
-
-   ```yaml
-   plugins:
-     starstuff.hello_world:
-       message: "Starting my plugin"
-   ```
-
-4. Run the Apollo Router and see your plugin start up
-
-   ```bash
-   cargo run -- --hot-reload --config router.yaml --supergraph supergraph-schema.graphql
-   ```
-
-   In your output you should see something like:
-
-   ```bash
-   2022-05-21T09:16:33.160288Z  INFO router::plugins::hello_world: Starting my plugin
-   ```
-
-# Remove a plugin
-
-1. From within your project run the following command. It makes a best effort to remove the plugin, but your mileage may vary.
-   ```bash
-   cargo router plugin remove hello_world
-   ```
+```yaml
+plugins:
+    aws.signv4:
+        access_key_id: "key"
+        secret_access_key: "secret"
+        region: "us-east-1"
+        service: "lambda"
+```
 
 ## Licensing
 
